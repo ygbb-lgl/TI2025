@@ -3,17 +3,9 @@ import numpy as np
 import random
 from scipy.optimize import least_squares
 from utils.measurement import calculate_distance_cm, calculate_real_size_cm
+from utils.serial_utils import send_data
 
 # 用于存储为未匹配数字选择的"粘性"边长
-sticky_choices = {}
-# 用于存储手动设置的目标数字
-target_digit_manual = None
-import numpy as np
-import random
-from scipy.optimize import least_squares
-from utils.measurement import calculate_distance_cm, calculate_real_size_cm
-
-# 用于存储为未匹配数字选择的“粘性”边长
 sticky_choices = {}
 # 用于存储手动设置的目标数字
 target_digit_manual = None
@@ -25,43 +17,21 @@ converter.current_camera = '2_1080'  # 使用1080p摄像头
 config = converter.get_camera_config()
 CAMERA_MATRIX = config['mtx']
 DIST_COEFFS = config['dist']
+FOCAL_LENGTH = (CAMERA_MATRIX[0, 0] + CAMERA_MATRIX[1, 1]) / 2
 KNOWN_A4_PAPER_WIDTH_MM = 210.0
 KNOWN_A4_PAPER_HEIGHT_MM = 297.0
 
-MIN_PAPER_AREA = 3000
-MAX_PAPER_AREA = 300000 # PnP适用范围更广，适当调大
-
-def order_points(pts):
-    """
-    对找到的四个角点进行排序，确保顺序为：左上、右上、右下、左下。
-    这是 PnP 算法正确工作的关键步骤。
-    """
-    rect = np.zeros((4, 2), dtype="float32")
-    
-    # 左上角的点 x+y 的和最小
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    
-    # 右下角的点 x+y 的和最大
-    rect[2] = pts[np.argmax(s)]
-    
-    # 右上角的点 y-x 的差最小
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    
-    # 左下角的点 y-x 的差最大
-    rect[3] = pts[np.argmax(diff)]
-    
-    return rect
+MIN_PAPER_AREA = 20000
+MAX_PAPER_AREA = 200000
 
 def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_digit=None):
     global target_digit_manual
     if frame is None:
         return True
     
-    # --- 新增：定义一个统一的显示缩放比例 ---
-    display_scale = 1/3
-
+    # 初始化距离和尺寸变量
+    distance_D_cm = -1.0
+    
     # 图像预处理，先去畸变
     h, w = frame.shape[:2]
     new_camera_mtx, roi = cv2.getOptimalNewCameraMatrix(CAMERA_MATRIX, DIST_COEFFS, (w, h), 1, (w, h))
@@ -90,13 +60,13 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
     binary_frame = cv2.morphologyEx(binary_frame, cv2.MORPH_OPEN, kernel, iterations=1)
     binary_frame = cv2.resize(binary_frame, (0, 0), fx=binary_scale, fy=binary_scale, interpolation=cv2.INTER_AREA)
     #cv2.imshow('binary', binary_frame)
+    
     # --- 步骤1：检测A4纸外轮廓和内边框 ---
     contours, _ = cv2.findContours(binary_frame, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     paper_contour = None
     paper_area = 0
     paper_pixel_width = -1.0 # 新增：用于存储A4纸像素宽度作为比例尺
-    distance_D_cm = -1.0
     if contours:
         valid_contours = [c for c in contours if MIN_PAPER_AREA < cv2.contourArea(c) < MAX_PAPER_AREA]
         if valid_contours:
@@ -105,41 +75,20 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
             peri = cv2.arcLength(paper_contour, True)
             approx = cv2.approxPolyDP(paper_contour, 0.02 * peri, True)
             if len(approx) == 4:
-                # --- 核心修改：使用 PnP 算法替换焦距法 ---
-                
-                # 1. 定义世界坐标系中的3D点 (A4纸的四个角点)
-                object_points = np.array([
-                    [0, 0, 0],
-                    [KNOWN_A4_PAPER_WIDTH_MM, 0, 0],
-                    [KNOWN_A4_PAPER_WIDTH_MM, KNOWN_A4_PAPER_HEIGHT_MM, 0],
-                    [0, KNOWN_A4_PAPER_HEIGHT_MM, 0]
-                ], dtype="float32")
-
-                # 2. 获取图像坐标系中的2D点，并排序
-                image_points_scaled = approx.reshape(4, 2).astype('float32')
-                
-                # --- 关键修复：将角点坐标从缩放后的图像还原到原始尺寸, 以便进行PnP计算 ---
-                image_points_original = image_points_scaled / total_scale
-                sorted_image_points_original = order_points(image_points_original)
-
-                # 3. 调用 solvePnP (使用原始尺寸的坐标和相机内参)
-                success, rvec, tvec = cv2.solvePnP(object_points, sorted_image_points_original, CAMERA_MATRIX, DIST_COEFFS)
-
-                if success:
-                    # tvec[2] 就是我们需要的深度信息（距离），单位是毫米
-                    distance_D_cm = tvec[2][0] / 10.0
-                    distance_D_cm = distance_D_cm - 5.0  # <--- 修改这里，进行线性校正
-                    send_size_to_t2(ser_sender, distance_D_cm)
-                    print(f"检测到A4纸，PnP距离D: {distance_D_cm:.2f} cm")
-
-                # --- 关键修改：为比例计算获取A4纸在放大图像上的像素宽度 ---
-                # 我们直接使用在放大图像上检测到的角点计算宽度，以确保与后续检测的正方形尺寸在同一尺度
-                sorted_image_points_scaled = order_points(image_points_scaled)
-                sides_scaled = sorted([np.linalg.norm(sorted_image_points_scaled[i] - sorted_image_points_scaled[(i + 1) % 4]) for i in range(4)])
-                # --- 关键修复：使用短边 (210mm) 作为比例基准，与task1和计算公式保持一致 ---
-                paper_pixel_width = (sides_scaled[0] + sides_scaled[1]) / 2 
-                
                 cv2.drawContours(frame, [approx], -1, (255, 0, 0), 2)
+                points = approx.reshape(4, 2)
+                sides = sorted([np.linalg.norm(points[i] - points[(i + 1) % 4]) for i in range(4)])
+                paper_pixel_width = (sides[0] + sides[1]) / 2
+                paper_pixel_height = (sides[2] + sides[3]) / 2
+                paper_pixel_width_original = paper_pixel_width / total_scale
+                paper_pixel_height_original = paper_pixel_height / total_scale
+                mm_per_pixel = KNOWN_A4_PAPER_WIDTH_MM / paper_pixel_width_original  # 每像素多少mm
+                dist_from_width = calculate_distance_cm(KNOWN_A4_PAPER_WIDTH_MM, FOCAL_LENGTH, paper_pixel_width_original)
+                dist_from_height = calculate_distance_cm(KNOWN_A4_PAPER_HEIGHT_MM, FOCAL_LENGTH, paper_pixel_height_original)
+                if dist_from_width > 0 and dist_from_height > 0:
+                    distance_D_cm = (dist_from_width + dist_from_height) / 2.0
+                    print(f"检测到A4纸，距离D: {distance_D_cm:.2f} cm")
+    
     squares = []
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
@@ -171,14 +120,10 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
     for pt in inner_pts:
         cv2.circle(frame, tuple(pt.astype(int)), 5, (255,255,0), -1)
 
-    # --- 步骤2.5：检查A4纸像素宽度比例尺 ---
-    if paper_pixel_width <= 0:
-        print("未检测到有效的A4纸宽度，无法计算比例尺，跳过此帧。")
-        cv2.imshow("Task 7 - Square Size + OCR", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            return False
-        return True
-    # mm_per_pixel = KNOWN_A4_PAPER_WIDTH_MM / paper_pixel_width # 此方法已弃用，因为分子分母尺度不同
+    # --- 步骤2.5：计算A4纸像素宽度比例尺 ---
+    # 取A4外边框的四个点，计算上边和下边的像素长度，取平均
+    paper_pixel_width_original = paper_pixel_width / total_scale
+    mm_per_pixel = KNOWN_A4_PAPER_WIDTH_MM / paper_pixel_width_original  # 每像素多少mm
 
     # --- 步骤4：只在A4内边框区域内找正方形 ---
     mask = np.zeros_like(binary_frame)
@@ -186,11 +131,7 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
     # 对mask做腐蚀，收缩内边框，避免与外框黏连
     #mask = cv2.erode(mask, np.ones((7,7), np.uint8), iterations=1)
     masked_binary = cv2.bitwise_and(binary_frame, binary_frame, mask=mask)
-    
-    # --- 修改：统一所有调试窗口的缩放比例 ---
-    display_masked_binary = cv2.resize(masked_binary, (0, 0), fx=display_scale, fy=display_scale, interpolation=cv2.INTER_NEAREST)
-    cv2.imshow('masked_binary', display_masked_binary)
-    
+    cv2.imshow('masked_binary', masked_binary)
     shape_contours, hierarchy = cv2.findContours(masked_binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
 
     found_squares = []
@@ -246,7 +187,7 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
             ocr_frame_final = cv2.bilateralFilter(ocr_frame_enhanced, 5, 50, 50)
             
             # 显示处理后的OCR图像（调试用）
-            ocr_display = cv2.resize(ocr_frame_final, (0, 0), fx=display_scale, fy=display_scale, interpolation=cv2.INTER_NEAREST) # 使用统一的缩放比例
+            ocr_display = cv2.resize(ocr_frame_final, (0, 0), fx=0.3, fy=0.3)
             cv2.imshow('OCR Enhanced', ocr_display)
             
             # OCR识别
@@ -349,7 +290,7 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
                 closest_square['matched_number'] = number['digit']
                 # 动态换算真实边长
                 side_length_px = closest_square['size_px']
-                side_length = (side_length_px / paper_pixel_width) * KNOWN_A4_PAPER_WIDTH_MM / 10.0 + 0.8
+                side_length = (side_length_px / total_scale) * mm_per_pixel / 10.0 + 0.8
                 print(f"数字 '{number['digit']}' 匹配到正方形长度: {side_length:.2f} cm")
 
     # --- 步骤4.65: 处理请求并发送数据 ---
@@ -358,16 +299,21 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
     if test_digit is not None:
         target_digit = str(test_digit)
         print(f"[TEST] 使用测试目标数字: {target_digit}")
-    # 任何模式下，都优先使用从main.py设置的全局变量
-    elif target_digit_manual is not None:
+    # 调试模式下，优先使用手动设置的数字
+    elif debug_mode and target_digit_manual is not None:
+        target_digit = target_digit_manual
+        print(f"使用手动设置的目标数字: {target_digit}")
+        # 使用后重置，避免重复发送
+        # target_digit_manual = None  <-- 我注释掉了这一行
+    # 否则，在非调试模式下，检查串口
+    elif not debug_mode and ser_receiver and ser_receiver.in_waiting > 0:
         try:
-            # 从全局变量获取数字，并减去10
-            target_digit = str(int(target_digit_manual) - 10)
-            print(f"使用从主程序设置的目标数字: {target_digit_manual}，处理后为: {target_digit}")
-        except (ValueError, TypeError):
-            print(f"无法处理目标数字: {target_digit_manual}")
-        # 使用后不重置，以便在任务7中持续有效
-        # target_digit_manual = None
+            received_data = ser_receiver.read(ser_receiver.in_waiting).decode('utf-8').strip()
+            if received_data and received_data.isdigit():
+                target_digit = received_data
+                print(f"从串口接收到目标数字: {target_digit}")
+        except Exception as e:
+            print(f"处理串口数据时出错: {e}")
 
     print(f"target_digit 当前值: {target_digit}")
     if target_digit:
@@ -377,13 +323,7 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
             response = f"6.50"
             print(f"准备发送数据: {response.strip()}")
             try:
-                size_to_send = 6.5 + 0.8
-                if 'distance_D_cm' in locals():
-                    if distance_D_cm > 160:
-                        size_to_send += 0.3
-                    if distance_D_cm > 180:
-                        size_to_send += 0.2
-                send_size_to_t3(ser_sender, size_to_send)
+                send_size_to_t3(ser_sender, 6.5 + 0.8, distance_D_cm)
             except AttributeError:
                 print("串口不可用，发送被跳过。")
             except Exception as e:
@@ -393,36 +333,99 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
             found = False
             for square in found_squares:
                 if square['matched_number'] == target_digit:
-                    # 使用在识别时计算好的平均边长，这更精确
-                    side_length_px = square['size_px']
-                    if side_length_px > 0:
-                        # --- 核心算法：使用精确的比例方法计算 ---
-                        # 该方法与task1完全一致，确保了计算的准确性和稳定性
-                        side_length = (side_length_px / paper_pixel_width) * KNOWN_A4_PAPER_WIDTH_MM / 10.0 + 0.8
-
-                        print(f"准备发送数据: {side_length:.2f}")
+                    # 用contourArea计算面积，开根号得到像素边长
+                    area = cv2.contourArea(square['contour'])
+                    if area > 0:
+                        side_length_px = np.sqrt(area)
+                        side_length = (side_length_px / total_scale) * mm_per_pixel / 10.0 + 0.8
+                        response = f"SIZE:{side_length:.2f}\n"
+                        print(f"准备发送数据: {response.strip()}")
                         try:
-                            send_size_to_t3(ser_sender, side_length)
+                            send_size_to_t3(ser_sender, side_length, distance_D_cm)
                         except AttributeError:
                             print("串口不可用，发送被跳过。")
                         except Exception as e:
                             print(f"串口发送失败: {e}")
-                        print(f"为数字 '{target_digit}' 找到匹配的正方形，使用平均边长计算，发送边长: {side_length:.2f} cm")
+                        print(f"为数字 '{target_digit}' 找到匹配的正方形，面积: {area:.2f}，发送边长: {side_length:.2f} cm")
                         found = True
                         break
             
             if not found:
-                print(f"未找到与数字 '{target_digit}' 匹配的正方形，本轮不发送数据。")
-                # 根据新要求，如果未找到匹配项，则不执行任何操作，也不发送任何数据。
-                pass
+                print(f"未找到与数字 '{target_digit}' 匹配的正方形。正在尝试备用策略...")
+
+                # 检查是否有"粘性"选择
+                if target_digit in sticky_choices:
+                    # 重新计算当前帧的真实边长（而不是直接复用旧值）
+                    # 找到所有未匹配数字的正方形
+                    unmatched_squares = [s for s in found_squares if s['matched_number'] is None]
+                    if unmatched_squares:
+                        # 取与 sticky_choices[target_digit] 最接近的正方形
+                        prev_length = sticky_choices[target_digit]
+                        chosen_square = min(unmatched_squares, key=lambda s: abs((s['size_px'] / total_scale) * mm_per_pixel / 10.0 + 0.6 - prev_length))
+                        side_length_px = chosen_square['size_px']
+                        side_length = (side_length_px / total_scale) * mm_per_pixel / 10.0 + 0.6
+                        # 更新 sticky_choices
+                        sticky_choices[target_digit] = side_length
+                        response = f"SIZE:{side_length:.2f}\n"
+                        print(f"准备发送数据: {response.strip()}")
+                        try:
+                            send_size_to_t3(ser_sender, side_length, distance_D_cm)
+                        except AttributeError:
+                            print("串口不可用，发送被跳过。")
+                        except Exception as e:
+                            print(f"串口发送失败: {e}")
+                        print(f"使用"粘性"选择为数字 '{target_digit}' 发送边长: {side_length:.2f} cm")
+                    else:
+                        # 没有未匹配正方形，直接发送旧值
+                        side_length = sticky_choices[target_digit] 
+                        response = f"SIZE:{side_length:.2f}\n"
+                        print(f"准备发送数据: {response.strip()}")
+                        try:
+                            send_size_to_t3(ser_sender, side_length, distance_D_cm)
+                        except AttributeError:
+                            print("串口不可用，发送被跳过。")
+                        except Exception as e:
+                            print(f"串口发送失败: {e}")
+                        print(f"使用"粘性"选择为数字 '{target_digit}' 发送边长: {side_length:.2f} cm")
+                else:
+                    # 找出所有没有匹配到数字的正方形
+                    unmatched_squares = [s for s in found_squares if s['matched_number'] is None]
+                    
+                    if unmatched_squares:
+                        # 随机选择一个未匹配的正方形
+                        chosen_square = random.choice(unmatched_squares)
+                        side_length_px = chosen_square['size_px']
+                        side_length = (side_length_px / total_scale) * mm_per_pixel / 10.0 + 0.6
+                        # 存储这个选择，以便下次使用
+                        sticky_choices[target_digit] = side_length
+                        
+                        response = f"SIZE:{side_length:.2f}\n"
+                        print(f"准备发送数据: {response.strip()}") # 无论如何都打印
+                        print(f"随机选择一个未匹配的正方形，为数字 '{target_digit}' 发送边长: {side_length:.2f} cm")
+                        try:
+                            send_size_to_t3(ser_sender, side_length, distance_D_cm)
+                        except AttributeError:
+                            print("串口不可用，发送被跳过。")
+                        except Exception as e:
+                            print(f"串口发送失败: {e}")
+                    else:
+                        # 如果没有未匹配的正方形，则发送未找到
+                        print(f"没有可用的未匹配正方形。")
+                        response = b"6.5"
+                        print(f"准备发送数据: {response.decode().strip()}")
+                        try:
+                            send_size_to_t3(ser_sender, 6.5, distance_D_cm)
+                        except AttributeError:
+                            print("串口不可用，发送被跳过。")
+                        except Exception as e:
+                            print(f"串口发送失败: {e}")
 
     # --- 步骤4.7：显示匹配结果 ---
     for square in found_squares:
         if square['center'] is not None:
             cx, cy = square['center']
             side_length_px = square['size_px']
-            # --- 核心算法：同样使用精确比例算法显示 ---
-            side_length = (side_length_px / paper_pixel_width) * KNOWN_A4_PAPER_WIDTH_MM / 10.0
+            side_length = (side_length_px / total_scale) * mm_per_pixel / 10.0 + 0.8
             # 显示正方形尺寸
             cv2.putText(frame, f"{side_length:.2f}cm", (cx, cy), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -448,7 +451,8 @@ def run_task7(frame, ser_sender, ser_receiver, ocr=None, debug_mode=False, test_
 
     # --- 步骤5：显示 ---
     cv2.putText(frame, f"Task: 7", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    # --- 修改：将最终要显示的图像缩小 ---
+    # 缩小显示，适配高分辨率
+    display_scale = 0.5
     display_frame = cv2.resize(frame, (0, 0), fx=display_scale, fy=display_scale, interpolation=cv2.INTER_AREA)
     cv2.imshow("Task 7 - Square Size + OCR", display_frame)
 
@@ -476,29 +480,7 @@ def debug_input_target():
             break
         set_target_number(user_input)
 
-
-def send_size_to_t3(ser_sender, size_cm):
-    if size_cm == -1:
-        print("t3尺寸为-1，跳过发送")
-        return
-    if not (ser_sender and ser_sender.is_open):
-        return
-    end_cmd = bytes.fromhex('ff ff ff')
-    # 修改：只发送数值，单位由HMI处理或在其他地方统一添加
-    size_str = f'{size_cm:.2f}' 
-    cmd = f't3.txt="{size_str}"'
-    ser_sender.write(cmd.encode("gb2312"))
-    ser_sender.write(end_cmd)
-
-def send_size_to_t2(ser_sender, size_cm):
-    if size_cm == -1:
-        print("t2尺寸为-1，跳过发送")
-        return
-    if not (ser_sender and ser_sender.is_open):
-        return
-    end_cmd = bytes.fromhex('ff ff ff')
-    # 修改：只发送数值，单位由HMI处理或在其他地方统一添加
-    size_str = f'{size_cm:.2f}'
-    cmd = f't2.txt="{size_str}"'
-    ser_sender.write(cmd.encode("gb2312"))
-    ser_sender.write(end_cmd)
+def send_size_to_t3(ser_sender, size_cm, distance_cm=-1.0):
+    """发送距离到t2，尺寸到t3，参考task1的发送方式"""
+    send_data(ser_sender, 't2', 'txt', distance_cm)  # 距离发送到t2
+    send_data(ser_sender, 't3', 'txt', size_cm)      # 尺寸发送到t3

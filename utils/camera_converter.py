@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from utils import Camera_config
 # 示例：已知深度的情况下进行坐标转换
 # converter = CameraConverter()
 # converter.current_camera = 1
@@ -30,23 +31,15 @@ class CameraConverter:
                 "has_distortion": True
             },
             '2_640': {
-                "name": "摄像头2 (无畸变)",
-                "mtx": np.array([
-                     [640.38363912 ,  0        ,319.99999154],
-                     [  0      ,   639.31966916 ,240.00000164],
-                     [  0       ,    0          , 1        ]
-                ], dtype=np.float32),
-                "dist": np.array([[0, 0, 0, 0, 0]], dtype=np.float32),
-                "has_distortion": False
+                "name": "摄像头2 (有畸变)",
+                "mtx": Camera_config.Intrinsic_Mtx_Wheeltec,
+                "dist": Camera_config.dist_wheeltec,
+                "has_distortion": True
             },
             '2_1080': {
-                "name": "摄像头2_1080 (无畸变)",
-                "mtx": np.array([
-                    [1.91981113e+03, 0.00000000e+00 ,9.60000014e+02],
-                    [0.00000000e+00 ,1.92059740e+03 ,5.40000000e+02],
-                    [0.00000000e+00 ,0.00000000e+00 ,1.00000000e+00]
-                ], dtype=np.float32),
-                "dist": np.array([[0,0,0,0,0]], dtype=np.float32),
+                "name": "摄像头2_1080 (有畸变)",
+                "mtx": Camera_config.Intrinsic_Mtx_Wheeltec_1080_after,
+                "dist": np.array([0,0,0,0,0], dtype=np.float32),
                 "has_distortion": False
             }
         }
